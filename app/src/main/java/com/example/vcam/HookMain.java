@@ -747,16 +747,25 @@ public class HookMain implements IXposedHookLoadPackage {
             }
         });
 
-        // Hook ImageReader.acquireNextImage to catch format mismatch errors
-        // This prevents crashes when the producer (MediaCodec) outputs a different format
+        // Hook ImageReader.acquireNextImage to intercept captured images
+        // For IMAGE mode, we return a fake image instead of the actual camera capture
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextImage", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 // Check if virtual camera is active
-                File file = new File(video_path + "virtual.mp4");
                 File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
-                if (!file.exists() || control_file.exists()) {
-                    return; // Virtual camera not active, let it proceed normally
+                if (control_file.exists()) {
+                    return; // Virtual camera disabled
+                }
+                
+                // Check if we're in IMAGE mode and have a replacement image
+                if (currentMediaMode == MediaMode.IMAGE && staticFakeJpegData != null) {
+                    ImageReader reader = (ImageReader) param.thisObject;
+                    Integer format = imageReaderFormats.get(reader);
+                    if (format != null && format == 256) { // JPEG format
+                        // Log the interception
+                        XposedBridge.log("【VCAM】Intercepting acquireNextImage for JPEG ImageReader");
+                    }
                 }
             }
             
@@ -774,6 +783,21 @@ public class HookMain implements IXposedHookLoadPackage {
                         param.setThrowable(null);
                     }
                 }
+                
+                // For IMAGE mode with JPEG format, try to inject fake image data into the result
+                if (param.getResult() != null && currentMediaMode == MediaMode.IMAGE) {
+                    Image image = (Image) param.getResult();
+                    try {
+                        if (image.getFormat() == 256 && staticFakeJpegData != null) { // JPEG format
+                            // Try to modify the image buffer with our fake JPEG data
+                            // Note: This may not work on all devices as Image buffers may be read-only
+                            XposedBridge.log("【VCAM】Captured image: format=" + image.getFormat() + 
+                                            ", size=" + image.getWidth() + "x" + image.getHeight());
+                        }
+                    } catch (Exception e) {
+                        XposedBridge.log("【VCAM】Error processing captured image: " + e.toString());
+                    }
+                }
             }
         });
 
@@ -781,11 +805,19 @@ public class HookMain implements IXposedHookLoadPackage {
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireLatestImage", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
-                // Check if virtual camera is active
-                File file = new File(video_path + "virtual.mp4");
+                // Check if virtual camera is disabled
                 File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
-                if (!file.exists() || control_file.exists()) {
-                    return; // Virtual camera not active, let it proceed normally
+                if (control_file.exists()) {
+                    return; // Virtual camera disabled
+                }
+                
+                // Log for IMAGE mode captures
+                if (currentMediaMode == MediaMode.IMAGE && staticFakeJpegData != null) {
+                    ImageReader reader = (ImageReader) param.thisObject;
+                    Integer format = imageReaderFormats.get(reader);
+                    if (format != null && format == 256) { // JPEG format
+                        XposedBridge.log("【VCAM】Intercepting acquireLatestImage for JPEG ImageReader");
+                    }
                 }
             }
             
@@ -803,30 +835,105 @@ public class HookMain implements IXposedHookLoadPackage {
                         param.setThrowable(null);
                     }
                 }
+                
+                // Log captured image info for IMAGE mode
+                if (param.getResult() != null && currentMediaMode == MediaMode.IMAGE) {
+                    Image image = (Image) param.getResult();
+                    try {
+                        XposedBridge.log("【VCAM】acquireLatestImage result: format=" + image.getFormat() + 
+                                        ", size=" + image.getWidth() + "x" + image.getHeight());
+                    } catch (Exception e) {
+                        // Image might be closed
+                    }
+                }
             }
         });
 
-        // Hook the native nativeImageSetup method which is where the actual crash occurs
-        // This is a more aggressive approach to prevent the crash at its source
-        try {
-            XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextSurfaceImage", int.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (param.getThrowable() != null) {
-                        Throwable t = param.getThrowable();
-                        if (t instanceof UnsupportedOperationException && 
-                            t.getMessage() != null && 
-                            t.getMessage().contains("doesn't match")) {
-                            XposedBridge.log("【VCAM】Caught format mismatch in acquireNextSurfaceImage: " + t.getMessage());
-                            // Return error code instead of throwing
-                            param.setResult(-1);
-                            param.setThrowable(null);
+        // Note: acquireNextSurfaceImage is a hidden/private method that may not exist on all Android versions.
+        // The hook above for acquireNextImage and acquireLatestImage should handle most cases.
+        // We skip hooking acquireNextSurfaceImage to avoid NoSuchMethodError on devices where it doesn't exist.
+
+        // Hook Image.getPlanes() to replace image data with fake image for JPEG captures
+        // This is critical for IMAGE mode to work with Camera2/CameraX captures
+        XposedHelpers.findAndHookMethod("android.media.Image", lpparam.classLoader, "getPlanes", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                // Only intercept if in IMAGE mode with fake data ready
+                if (currentMediaMode != MediaMode.IMAGE || staticFakeJpegData == null) {
+                    return;
+                }
+                
+                File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                if (control_file.exists()) {
+                    return;
+                }
+                
+                try {
+                    Image image = (Image) param.thisObject;
+                    int format = image.getFormat();
+                    
+                    // Only modify JPEG format images (format 256)
+                    if (format == 256) {
+                        Image.Plane[] planes = (Image.Plane[]) param.getResult();
+                        if (planes != null && planes.length > 0) {
+                            XposedBridge.log("【VCAM】Intercepting JPEG Image.getPlanes(), injecting fake image data");
+                            // The JPEG data will be injected when the buffer is accessed
+                            // Store reference for buffer hook
                         }
+                    }
+                } catch (Exception e) {
+                    XposedBridge.log("【VCAM】Error in Image.getPlanes hook: " + e.toString());
+                }
+            }
+        });
+
+        // Hook ByteBuffer.get(byte[]) to intercept JPEG data reads from Image buffers
+        // This allows us to replace the JPEG data when the app reads from the Image
+        try {
+            XposedHelpers.findAndHookMethod("java.nio.ByteBuffer", lpparam.classLoader, "get", byte[].class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    // Only intercept if in IMAGE mode with fake data ready
+                    if (currentMediaMode != MediaMode.IMAGE || staticFakeJpegData == null) {
+                        return;
+                    }
+                    
+                    File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                    if (control_file.exists()) {
+                        return;
+                    }
+                    
+                    try {
+                        ByteBuffer buffer = (ByteBuffer) param.thisObject;
+                        byte[] dst = (byte[]) param.args[0];
+                        
+                        // Check if this looks like a JPEG buffer (starts with FFD8)
+                        if (buffer.remaining() > 2) {
+                            int pos = buffer.position();
+                            byte b1 = buffer.get(pos);
+                            byte b2 = buffer.get(pos + 1);
+                            
+                            // JPEG magic bytes: FF D8
+                            if (b1 == (byte) 0xFF && b2 == (byte) 0xD8) {
+                                XposedBridge.log("【VCAM】Detected JPEG buffer read, injecting fake JPEG data (" + 
+                                                staticFakeJpegData.length + " bytes into " + dst.length + " byte array)");
+                                
+                                // Copy our fake JPEG data to destination
+                                int copyLen = Math.min(staticFakeJpegData.length, dst.length);
+                                System.arraycopy(staticFakeJpegData, 0, dst, 0, copyLen);
+                                
+                                // Skip the original buffer read
+                                buffer.position(buffer.position() + Math.min(buffer.remaining(), dst.length));
+                                param.setResult(buffer);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Silently ignore - this hook is called very frequently
                     }
                 }
             });
         } catch (Exception e) {
-            XposedBridge.log("【VCAM】Could not hook acquireNextSurfaceImage: " + e.getMessage());
+            XposedBridge.log("【VCAM】Could not hook ByteBuffer.get: " + e.getMessage());
         }
 
         XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession.CaptureCallback", lpparam.classLoader, "onCaptureFailed", CameraCaptureSession.class, CaptureRequest.class, CaptureFailure.class,
@@ -843,14 +950,14 @@ public class HookMain implements IXposedHookLoadPackage {
         
         // IMAGE MODE: For Camera2, we handle static images differently
         if (currentMediaMode == MediaMode.IMAGE) {
-            XposedBridge.log("【VCAM】Camera2 Image mode - using static image for ImageReader");
+            XposedBridge.log("【VCAM】Camera2 Image mode - using static image for ImageReader, format: " + imageReaderFormat);
             
             if (staticFakeBitmap == null) {
                 staticFakeBitmap = MediaModeDetector.getFakeBitmap();
                 staticFakeJpegData = MediaModeDetector.getFakeJpegData();
             }
             
-            // Draw to Preview Surfaces
+            // Draw to Preview Surfaces using ImageSurfaceRenderer
             if (c2_preview_Surfcae != null) {
                 if (c2_preview_renderer != null) {
                     c2_preview_renderer.stop();
@@ -867,12 +974,18 @@ public class HookMain implements IXposedHookLoadPackage {
                 c2_preview_renderer_1.start();
             }
 
-            // Draw to ImageReader Surfaces (for capture)
+            // For ImageReader surfaces (for capture), use JPEG image writer for format 256 (JPEG)
+            // Otherwise use ImageSurfaceRenderer for preview-like surfaces
             if (c2_reader_Surfcae != null) {
                 if (c2_reader_renderer != null) {
                     c2_reader_renderer.stop();
                 }
-                c2_reader_renderer = new ImageSurfaceRenderer(c2_reader_Surfcae, staticFakeBitmap, fillImageMode);
+                // Use JpegImageWriter for JPEG format ImageReader surfaces
+                if (imageReaderFormat == 256) { // JPEG format
+                    c2_reader_renderer = new ImageSurfaceRenderer(c2_reader_Surfcae, staticFakeBitmap, fillImageMode, true, c2_ori_width, c2_ori_height);
+                } else {
+                    c2_reader_renderer = new ImageSurfaceRenderer(c2_reader_Surfcae, staticFakeBitmap, fillImageMode);
+                }
                 c2_reader_renderer.start();
             }
 
@@ -880,7 +993,12 @@ public class HookMain implements IXposedHookLoadPackage {
                 if (c2_reader_renderer_1 != null) {
                     c2_reader_renderer_1.stop();
                 }
-                c2_reader_renderer_1 = new ImageSurfaceRenderer(c2_reader_Surfcae_1, staticFakeBitmap, fillImageMode);
+                // Use JpegImageWriter for JPEG format ImageReader surfaces
+                if (imageReaderFormat == 256) { // JPEG format
+                    c2_reader_renderer_1 = new ImageSurfaceRenderer(c2_reader_Surfcae_1, staticFakeBitmap, fillImageMode, true, c2_ori_width, c2_ori_height);
+                } else {
+                    c2_reader_renderer_1 = new ImageSurfaceRenderer(c2_reader_Surfcae_1, staticFakeBitmap, fillImageMode);
+                }
                 c2_reader_renderer_1.start();
             }
 

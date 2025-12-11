@@ -11,6 +11,7 @@ import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.util.Arrays;
 
 import de.robv.android.xposed.XposedBridge;
 
@@ -49,9 +50,19 @@ public class MediaModeDetector {
      */
     public static MediaMode detectMode(String basePath) {
         if (basePath == null || basePath.isEmpty()) {
+            XposedBridge.log("【VCAM】detectMode: basePath is null or empty");
             return MediaMode.NONE;
         }
         
+        File dir = new File(basePath);
+        if (!dir.exists()) {
+            XposedBridge.log("【VCAM】detectMode: Directory does not exist: " + basePath);
+            return MediaMode.NONE;
+        }
+        if (!dir.canRead()) {
+            XposedBridge.log("【VCAM】detectMode: Directory not readable: " + basePath);
+        }
+
         // First check for image files (image mode takes priority)
         String imagePath = findImageFile(basePath);
         if (imagePath != null) {
@@ -71,6 +82,24 @@ public class MediaModeDetector {
         
         sCurrentMode = MediaMode.NONE;
         XposedBridge.log("【VCAM】No media file found in: " + basePath);
+
+        // Debug: List files in the directory to identify issues
+        try {
+            File[] files = dir.listFiles();
+            if (files != null) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("Files in directory: ");
+                for (File f : files) {
+                    sb.append(f.getName()).append(", ");
+                }
+                XposedBridge.log("【VCAM】" + sb.toString());
+            } else {
+                XposedBridge.log("【VCAM】listFiles() returned null (access denied?)");
+            }
+        } catch (Exception e) {
+            XposedBridge.log("【VCAM】Error listing files: " + e.toString());
+        }
+
         return MediaMode.NONE;
     }
     
